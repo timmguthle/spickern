@@ -268,3 +268,70 @@ dialog p { margin: 0 0 16px; color: var(--muted); }
   .a-score { font-size: 130px; }
   .slot { height: 54px; font-size: 26px; }
 }
+
+/* ---------- stats file & statistics page ---------- */
+.icon-btn.labeled { width: auto; padding: 0 12px; display: inline-flex; gap: 6px; font-size: 14px; font-weight: 600; color: var(--text); }
+.brand .icon-btn.labeled { margin-left: auto; height: 42px; }
+.btn.sm { height: 36px; padding: 0 13px; font-size: 13px; border-radius: 10px; }
+
+.file-banner {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
+  padding: 10px 10px 10px 12px; margin-bottom: 14px;
+}
+.file-banner.ok { border-color: #22583c; background: #13211a; }
+.file-banner.warn { border-color: #6b5520; background: #221d10; }
+.fb-icon { width: 36px; height: 36px; flex: none; border-radius: 10px; display: grid; place-items: center; background: var(--surface-3); color: var(--muted); }
+.file-banner.ok .fb-icon { background: var(--green-d); color: #fff; }
+.file-banner.warn .fb-icon { background: #5c4813; color: var(--gold); }
+.fb-text { flex: 1; min-width: 0; }
+.fb-text b { display: block; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-text small { display: block; font-size: 12px; color: var(--muted); line-height: 1.35; }
+.fb-actions { display: flex; gap: 6px; flex: none; }
+
+.file-row { display: flex; gap: 12px; align-items: flex-start; }
+.file-row .fb-text b { white-space: normal; font-size: 15px; }
+.file-row .fb-text small { font-size: 13px; margin-top: 2px; }
+.file-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+
+.pname small { display: block; font-size: 12px; font-weight: 500; color: var(--muted); }
+
+.page-head { display: flex; align-items: center; gap: 12px; margin: 0 0 18px; }
+.page-head h1 { margin: 0; font-family: var(--font-num); font-size: 32px; font-weight: 700; line-height: 1; }
+.seg.filter { grid-template-columns: repeat(3, 1fr); margin-bottom: 14px; }
+.seg.filter button { height: 42px; font-size: 20px; }
+
+.pstat { background: var(--surface-2); border-radius: 14px; padding: 12px; }
+.pstat + .pstat { margin-top: 8px; }
+.pstat-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.pstat-name { font-weight: 700; font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pstat-avg { text-align: right; flex: none; }
+.pstat-avg b { display: block; font-family: var(--font-num); font-size: 30px; line-height: 1; color: var(--gold); }
+.pstat-avg small { font-size: 11px; color: var(--muted); }
+.pstat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.cell { background: var(--bg); border-radius: 10px; padding: 7px 8px; min-width: 0; }
+.cell span { display: block; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell b { display: block; font-family: var(--font-num); font-size: 21px; font-weight: 600; line-height: 1.15; }
+.cell b small { font-family: var(--font); font-size: 10px; color: var(--muted); font-weight: 500; }
+
+.games { list-style: none; margin: 0 0 10px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.game-row { background: var(--surface-2); border-radius: 12px; padding: 10px 12px; }
+.gr-top { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); margin-bottom: 6px; flex-wrap: wrap; }
+.gr-players { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 15px; }
+.gr-players span { white-space: nowrap; }
+.gr-players b { font-family: var(--font-num); font-size: 18px; margin-left: 3px; }
+.gr-players .w { color: var(--gold); font-weight: 600; }
+.games + .btn, .panel > .btn { width: 100%; }
+
+.save-note { font-size: 13px; margin: 14px 0 0 !important; color: var(--muted); }
+
+#toast.msg { top: auto; bottom: calc(env(safe-area-inset-bottom) + 90px); max-width: calc(100vw - 32px); padding: 12px 18px; border-radius: 14px; }
+#toast.msg span { color: var(--text); margin: 0; font-size: 14px; }
+#toast.msg.err { background: rgba(158, 42, 35, .97); border-color: var(--red); }
+
+@media (max-width: 380px) {
+  .pstat-grid { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 340px) {
+  .fb-text small { display: none; }
+}

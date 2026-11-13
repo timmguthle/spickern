@@ -1,9 +1,15 @@
 'use strict';
 
 /* ============================================================
-   Persistence
+   Persistence (browser)
    ============================================================ */
-const KEYS = { roster: 'darts.roster.v1', settings: 'darts.settings.v1', match: 'darts.match.v1' };
+const KEYS = {
+  roster: 'darts.roster.v1',
+  settings: 'darts.settings.v1',
+  match: 'darts.match.v1',
+  stats: 'darts.stats.v1',
+  meta: 'darts.statsmeta.v1',
+};
 
 function load(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
@@ -20,12 +26,27 @@ const state = {
   roster: load(KEYS.roster, []),
   settings: { start: 501, doubleOut: true, players: [], ...load(KEYS.settings, {}) },
   match: load(KEYS.match, null),
-  mod: 1, // pending multiplier for the next dart: 1 single, 2 double, 3 triple
+  mod: 1,            // pending multiplier for the next dart: 1 single, 2 double, 3 triple
+  view: 'setup',     // 'setup' | 'stats' (the game view shows whenever a match is running)
+  statsFilter: 'all',
+  showAllGames: false,
 };
 state.settings.players = state.settings.players.filter(n => state.roster.includes(n));
 
+// Statistics: one record per finished leg. Everything else is computed from these.
+let stats = load(KEYS.stats, { legs: [] });
+if (!stats || !Array.isArray(stats.legs)) stats = { legs: [] };
+// rev counts changes; exportedRev is the rev last written to a file by manual download.
+const meta = { rev: 0, exportedRev: 0, ...load(KEYS.meta, {}) };
+
 const persistSetup = () => { save(KEYS.settings, state.settings); save(KEYS.roster, state.roster); };
 const persistMatch = () => save(KEYS.match, state.match);
+function statsChanged() {
+  meta.rev++;
+  save(KEYS.stats, stats);
+  save(KEYS.meta, meta);
+  queueWrite();
+}
 
 /* ============================================================
    Helpers
@@ -36,6 +57,8 @@ const $toast = document.getElementById('toast');
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const buzz = pattern => { try { navigator.vibrate && navigator.vibrate(pattern); } catch { /* ignore */ } };
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+const num = v => (Number.isFinite(+v) ? +v : 0);
 
 // A dart is { n: number (0 = miss, 1–20, 25), x: multiplier (1–3) }
 const dartValue = d => d.n * d.x;
@@ -46,7 +69,7 @@ function dartLabel(d) {
 }
 
 /* ============================================================
-   Game engine — the whole leg is derived from the list of darts,
+   Game engine: the whole leg is derived from the list of darts,
    so undo is just "remove the last dart".
    ============================================================ */
 function replay(m) {
@@ -145,24 +168,407 @@ function checkout(rem, darts, doubleOut) {
 }
 
 /* ============================================================
-   Rendering — setup
+   Statistics: recording and aggregation
+   ============================================================ */
+function buildLegRecord(m, g) {
+  return {
+    id: uid(),
+    match: m.id,
+    leg: m.leg,
+    date: new Date().toISOString(),
+    start: m.start,
+    doubleOut: m.doubleOut,
+    winner: g.ps[g.winner].name,
+    players: g.ps.map((p, i) => {
+      const scoring = p.turns.filter(t => !t.bust);
+      const first3 = p.turns.slice(0, 3);
+      const last = p.turns[p.turns.length - 1];
+      return {
+        name: p.name,
+        darts: p.darts,
+        points: m.start - p.remaining,
+        left: p.remaining,
+        high: p.high,
+        busts: p.turns.length - scoring.length,
+        t180: scoring.filter(t => t.total === 180).length,
+        t140: scoring.filter(t => t.total >= 140 && t.total < 180).length,
+        t100: scoring.filter(t => t.total >= 100 && t.total < 140).length,
+        first9: first3.reduce((a, t) => a + t.total, 0),
+        first9Darts: first3.reduce((a, t) => a + t.darts.length, 0),
+        checkout: i === g.winner ? last.total : null,
+        throws: p.turns.map(t => (t.bust ? '!' : '') + t.darts.map(dartLabel).join(' ')).join('|'),
+      };
+    }),
+  };
+}
+
+// Keeps the stats in step with the leg: a won leg gets recorded once,
+// and undoing the winning dart removes the record again.
+function syncLegRecord() {
+  const m = state.match;
+  if (!m) return;
+  if (!m.id) m.id = uid();
+  const g = replay(m);
+  if (g.winner != null && !m.legRecordId) {
+    const rec = buildLegRecord(m, g);
+    stats.legs.push(rec);
+    m.legRecordId = rec.id;
+    statsChanged();
+  } else if (g.winner == null && m.legRecordId) {
+    stats.legs = stats.legs.filter(l => l.id !== m.legRecordId);
+    m.legRecordId = null;
+    statsChanged();
+  }
+}
+
+const legsFor = filter => stats.legs.filter(l => filter === 'all' || num(l.start) === +filter);
+
+function aggregate(filter) {
+  const map = new Map();
+  for (const leg of legsFor(filter)) {
+    for (const p of leg.players || []) {
+      if (!p || typeof p.name !== 'string') continue;
+      let a = map.get(p.name);
+      if (!a) map.set(p.name, a = { name: p.name, legs: 0, won: 0, darts: 0, points: 0, f9: 0, f9d: 0, best: {}, hiCo: 0, high: 0, t180: 0, t140: 0, t100: 0, busts: 0 });
+      const won = leg.winner === p.name;
+      a.legs++;
+      a.darts += num(p.darts);
+      a.points += num(p.points);
+      a.f9 += num(p.first9);
+      a.f9d += num(p.first9Darts);
+      a.high = Math.max(a.high, num(p.high));
+      a.t180 += num(p.t180); a.t140 += num(p.t140); a.t100 += num(p.t100);
+      a.busts += num(p.busts);
+      if (won) {
+        a.won++;
+        a.hiCo = Math.max(a.hiCo, num(p.checkout));
+        const s = num(leg.start);
+        if (!a.best[s] || num(p.darts) < a.best[s]) a.best[s] = num(p.darts);
+      }
+    }
+  }
+  const list = [...map.values()].map(a => ({
+    ...a,
+    avg: a.darts ? a.points / a.darts * 3 : 0,
+    f9avg: a.f9d ? a.f9 / a.f9d * 3 : 0,
+    winPct: a.legs ? Math.round(a.won / a.legs * 100) : 0,
+  }));
+  return list.sort((x, y) => y.won - x.won || y.avg - x.avg);
+}
+
+function gameList(filter) {
+  const by = new Map();
+  for (const l of legsFor(filter)) {
+    const key = l.match || l.id;
+    let g = by.get(key);
+    if (!g) by.set(key, g = { date: String(l.date || ''), start: num(l.start), doubleOut: !!l.doubleOut, players: (l.players || []).map(p => p.name), wins: {}, legs: 0, darts: {} });
+    g.legs++;
+    g.wins[l.winner] = (g.wins[l.winner] || 0) + 1;
+    if (String(l.date) > g.date) g.date = String(l.date);
+    const w = (l.players || []).find(p => p.name === l.winner);
+    if (w) g.darts[l.winner] = Math.min(g.darts[l.winner] || Infinity, num(w.darts));
+  }
+  return [...by.values()].sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function fmtDate(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const opts = { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return d.toLocaleString(undefined, opts);
+}
+
+/* ============================================================
+   Stats file on the user's computer
+   - Chrome/Edge: the File System Access API keeps a file connected,
+     so every finished leg is written to it automatically.
+   - Other browsers: save (download) and load (upload) manually.
+   ============================================================ */
+const FS = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
+const FILE_TYPES = [{ description: 'Spickern stats', accept: { 'application/json': ['.json'] } }];
+const FILE_NAME = 'spickern-stats.json';
+const file = { handle: null, status: 'none', saving: false, savedAt: null, error: '' }; // status: none | prompt | connected | error
+
+function serialize() {
+  return JSON.stringify({ app: 'spickern', version: 1, savedAt: new Date().toISOString(), roster: state.roster, legs: stats.legs }, null, 2);
+}
+
+function parseStatsFile(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error('That file is not a Spickern stats file.'); }
+  if (!data || data.app !== 'spickern' || !Array.isArray(data.legs)) throw new Error('That file is not a Spickern stats file.');
+  return data;
+}
+
+// Combines the file's legs with the ones in this browser (nothing is lost on either side).
+function mergeData(data) {
+  const known = new Set(stats.legs.map(l => l.id));
+  let added = 0;
+  for (const l of data.legs) {
+    if (!l || typeof l.id !== 'string' || !Array.isArray(l.players) || known.has(l.id)) continue;
+    stats.legs.push(l);
+    known.add(l.id);
+    added++;
+  }
+  stats.legs.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  const names = new Set(state.roster.map(n => n.toLowerCase()));
+  for (const n of Array.isArray(data.roster) ? data.roster : []) {
+    if (typeof n !== 'string' || !n.trim() || names.has(n.toLowerCase())) continue;
+    state.roster.push(n.trim().slice(0, 20));
+    names.add(n.toLowerCase());
+  }
+  persistSetup();
+
+  const fileIds = new Set(data.legs.map(l => l && l.id));
+  const fileIsMissing = stats.legs.some(l => !fileIds.has(l.id));
+  if (added) { meta.rev++; save(KEYS.stats, stats); save(KEYS.meta, meta); }
+  return { added, fileIsMissing };
+}
+
+// --- IndexedDB, only used to remember which file is connected ---
+function idb(mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('spickern', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('kv');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      try {
+        const tx = open.result.transaction('kv', mode);
+        const req = fn(tx.objectStore('kv'));
+        tx.oncomplete = () => resolve(req.result);
+        tx.onerror = tx.onabort = () => reject(tx.error);
+      } catch (e) {
+        reject(e);
+      }
+    };
+  });
+}
+const idbGet = k => idb('readonly', s => s.get(k));
+const idbSet = (k, v) => idb('readwrite', s => s.put(v, k));
+const idbDel = k => idb('readwrite', s => s.delete(k));
+
+let writeChain = Promise.resolve();
+function queueWrite() {
+  if (!file.handle || file.status !== 'connected') return writeChain;
+  file.saving = true;
+  writeChain = writeChain.then(async () => {
+    try {
+      const w = await file.handle.createWritable();
+      await w.write(serialize());
+      await w.close();
+      file.savedAt = new Date();
+      file.error = '';
+    } catch (e) {
+      file.status = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError') ? 'prompt' : 'error';
+      file.error = (e && e.message) || 'Unknown error';
+    }
+    file.saving = false;
+    refreshFileUi();
+  });
+  return writeChain;
+}
+
+// Reads the file (if it has data), merges it in, and connects it for auto-saving.
+async function connectHandle(handle, mode) {
+  const text = (await (await handle.getFile()).text()).trim();
+  let result = { added: 0, fileIsMissing: true };
+  if (text) {
+    try { result = mergeData(parseStatsFile(text)); }
+    catch (e) { if (mode === 'open') throw e; /* 'create': user chose to replace it */ }
+  }
+  file.handle = handle;
+  file.status = 'connected';
+  file.error = '';
+  try { await idbSet('statsFile', handle); } catch { /* remembered for this session only */ }
+  if (result.fileIsMissing) await queueWrite();
+  else file.savedAt = new Date();
+  return result.added;
+}
+
+function legsMsg(added) {
+  return added ? ` · ${added} leg${added === 1 ? '' : 's'} loaded` : '';
+}
+
+async function openStatsFile() {
+  if (!FS) return pickFileFallback();
+  try {
+    const [h] = await window.showOpenFilePicker({ types: FILE_TYPES, multiple: false });
+    const added = await connectHandle(h, 'open');
+    toastMsg(`Connected to ${esc(h.name)}${legsMsg(added)}`);
+  } catch (e) {
+    if (e.name !== 'AbortError') toastMsg(esc(e.message), true);
+  }
+  render();
+}
+
+async function createStatsFile() {
+  try {
+    const h = await window.showSaveFilePicker({ suggestedName: FILE_NAME, types: FILE_TYPES });
+    const added = await connectHandle(h, 'create');
+    toastMsg(`Saving stats to ${esc(h.name)}${legsMsg(added)}`);
+  } catch (e) {
+    if (e.name !== 'AbortError') toastMsg(esc(e.message), true);
+  }
+  render();
+}
+
+async function reconnectFile() {
+  const h = file.handle;
+  if (!h) return openStatsFile();
+  try {
+    const perm = await h.requestPermission({ mode: 'readwrite' });
+    if (perm !== 'granted') throw new Error('Spickern needs permission to use the file.');
+    const added = await connectHandle(h, 'open');
+    toastMsg(`Connected to ${esc(h.name)}${legsMsg(added)}`);
+  } catch (e) {
+    if (e.name === 'NotFoundError') {
+      await disconnectFile();
+      toastMsg('The stats file was moved or deleted. Open it again.', true);
+    } else if (e.name !== 'AbortError') {
+      file.status = 'error';
+      file.error = e.message;
+      toastMsg(esc(e.message), true);
+    }
+  }
+  render();
+}
+
+async function disconnectFile() {
+  file.handle = null;
+  file.status = 'none';
+  file.savedAt = null;
+  try { await idbDel('statsFile'); } catch { /* ignore */ }
+  render();
+}
+
+function downloadStats() {
+  const blob = new Blob([serialize()], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = FILE_NAME;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  meta.exportedRev = meta.rev;
+  save(KEYS.meta, meta);
+  render();
+}
+
+function pickFileFallback() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.onchange = async () => {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    try {
+      const r = mergeData(parseStatsFile(await f.text()));
+      if (!r.fileIsMissing) { meta.exportedRev = meta.rev; save(KEYS.meta, meta); }
+      toastMsg(`Loaded ${esc(f.name)}${legsMsg(r.added)}`);
+    } catch (e) {
+      toastMsg(esc(e.message), true);
+    }
+    render();
+  };
+  input.click();
+}
+
+async function initFile() {
+  if (!FS || !window.indexedDB) return;
+  try {
+    const h = await idbGet('statsFile');
+    if (!h) return;
+    file.handle = h;
+    file.status = 'prompt';
+    if (await h.queryPermission({ mode: 'readwrite' }) === 'granted') await connectHandle(h, 'open');
+  } catch {
+    if (file.handle && file.status !== 'connected') file.status = 'prompt';
+  }
+  render();
+}
+
+function refreshFileUi() {
+  if (state.match) {
+    const note = document.getElementById('save-note');
+    if (note) note.innerHTML = saveNote();
+  } else if (!document.activeElement || document.activeElement.tagName !== 'INPUT') {
+    render();
+  }
+}
+
+function saveNote() {
+  if (file.status === 'connected') {
+    return file.saving ? `Saving to ${esc(file.handle.name)}…` : `✓ Stats saved to ${esc(file.handle.name)}`;
+  }
+  if (file.status === 'prompt' || file.status === 'error') return 'Stats saved in this browser. Reconnect your stats file on the start screen.';
+  return FS
+    ? 'Stats saved in this browser. Connect a stats file on the start screen to keep them on your computer.'
+    : 'Stats saved in this browser. Use “Save file” on the start screen to keep them on your computer.';
+}
+
+/* ============================================================
+   Rendering
    ============================================================ */
 function render() {
-  if (state.match) renderGame(); else renderSetup();
+  if (state.match) renderGame();
+  else if (state.view === 'stats') renderStats();
+  else renderSetup();
   keepAwake(!!state.match);
+}
+
+const ICON_FILE = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M5 2.5h6.5L15.5 6.5V17a.5.5 0 0 1-.5.5H5a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5Z"/><path d="M11.5 2.5v4h4"/></svg>';
+const ICON_CHART = '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 15V9M9 15V3M15 15v-4"/></svg>';
+const ICON_BACK = '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 3 5 9l6 6"/></svg>';
+
+// Compact one-line status on the start screen.
+function fileBanner() {
+  let icon = 'idle', text, actions;
+  if (FS) {
+    if (file.status === 'connected') {
+      icon = 'ok';
+      text = `<b>${esc(file.handle.name)}</b><small>Stats are saved here automatically</small>`;
+      actions = '<button class="btn sm" data-act="go-stats">View stats</button>';
+    } else if (file.status === 'prompt' || file.status === 'error') {
+      icon = 'warn';
+      text = `<b>${esc(file.handle.name)}</b><small>${file.status === 'error' ? 'Could not save. Reconnect the file.' : 'Reconnect to load your stats and keep saving'}</small>`;
+      actions = '<button class="btn sm primary" data-act="reconnect-file">Reconnect</button>';
+    } else {
+      text = '<b>Stats file</b><small>Keep your stats in a file on this computer</small>';
+      actions = '<button class="btn sm primary" data-act="open-file">Open</button><button class="btn sm" data-act="create-file">New</button>';
+    }
+  } else {
+    const unsaved = meta.rev > meta.exportedRev && stats.legs.length > 0;
+    icon = unsaved ? 'warn' : 'idle';
+    text = unsaved
+      ? '<b>Unsaved stats</b><small>Save them to a file on your device</small>'
+      : '<b>Stats file</b><small>Load your saved stats file</small>';
+    actions = `<button class="btn sm ${unsaved ? '' : 'primary'}" data-act="open-file">Load</button><button class="btn sm ${unsaved ? 'primary' : ''}" data-act="download-file">Save file</button>`;
+  }
+  return `<section class="file-banner ${icon}"><span class="fb-icon">${ICON_FILE}</span><span class="fb-text">${text}</span><span class="fb-actions">${actions}</span></section>`;
 }
 
 function renderSetup() {
   const s = state.settings;
   const bench = state.roster.filter(n => !s.players.includes(n));
   const full = s.players.length >= MAX_PLAYERS;
+  const career = new Map(aggregate('all').map(a => [a.name, a]));
+  const sub = n => {
+    const a = career.get(n);
+    return a ? `<small>Avg ${a.avg.toFixed(1)} · ${a.won}/${a.legs} legs won</small>` : '';
+  };
 
   $app.innerHTML = `
   <main class="setup">
     <header class="brand">
       <img src="icon.svg" alt="" width="44" height="44">
-      <div><h1>Dart Scorer</h1><p>Pick a game, add players, throw.</p></div>
+      <div><h1>Spickern</h1><p>Dart scoring, 301 &amp; 501</p></div>
+      <button class="icon-btn labeled" data-act="go-stats">${ICON_CHART}<span>Stats</span></button>
     </header>
+
+    ${fileBanner()}
 
     <section class="panel">
       <h2>Starting score</h2>
@@ -180,7 +586,7 @@ function renderSetup() {
         ${s.players.length > 1 ? '<button class="link" data-act="shuffle">Shuffle order</button>' : ''}</h2>
       ${s.players.length ? `<ol class="lineup">${s.players.map((n, i) => `
         <li>
-          <span class="pos">${i + 1}</span><span class="pname">${esc(n)}</span>
+          <span class="pos">${i + 1}</span><span class="pname">${esc(n)}${sub(n)}</span>
           <button class="mini" data-act="move-up" data-i="${i}" ${i === 0 ? 'disabled' : ''} aria-label="Move ${esc(n)} up">↑</button>
           <button class="mini" data-act="unpick" data-i="${i}" aria-label="Remove ${esc(n)} from game">✕</button>
         </li>`).join('')}</ol>`
@@ -195,7 +601,7 @@ function renderSetup() {
         <div class="chips">${bench.map(n => `
           <span class="chip">
             <button data-act="pick" data-name="${esc(n)}" ${full ? 'disabled' : ''}>+ ${esc(n)}</button>
-            <button class="chip-x" data-act="forget" data-name="${esc(n)}" aria-label="Delete ${esc(n)}">✕</button>
+            <button class="chip-x" data-act="forget" data-name="${esc(n)}" aria-label="Remove ${esc(n)} from saved players">✕</button>
           </span>`).join('')}
         </div>
       </div>` : ''}
@@ -209,9 +615,100 @@ function renderSetup() {
   </main>`;
 }
 
-/* ============================================================
-   Rendering — game
-   ============================================================ */
+/* ---------- statistics page ---------- */
+function filePanel() {
+  let body, actions;
+  if (FS) {
+    if (file.status === 'connected') {
+      const when = file.savedAt ? ` Last saved ${file.savedAt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}.` : '';
+      body = `<b>${esc(file.handle.name)}</b><small>Connected. Every finished leg is saved to this file automatically.${when}</small>`;
+      actions = '<button class="btn" data-act="open-file">Open other file</button><button class="btn" data-act="disconnect-file">Disconnect</button>';
+    } else if (file.status === 'prompt' || file.status === 'error') {
+      body = `<b>${esc(file.handle.name)}</b><small>${file.status === 'error' ? `Could not save (${esc(file.error)}).` : 'Your browser needs your OK to use this file again.'}</small>`;
+      actions = '<button class="btn primary" data-act="reconnect-file">Reconnect</button><button class="btn" data-act="open-file">Open other file</button>';
+    } else {
+      body = '<b>Not connected</b><small>Stats are only kept in this browser. Open your stats file to load it, or create a new one. After that, every finished leg is saved to it automatically.</small>';
+      actions = '<button class="btn primary" data-act="open-file">Open stats file</button><button class="btn" data-act="create-file">Create new file</button>';
+    }
+  } else {
+    const unsaved = meta.rev > meta.exportedRev && stats.legs.length > 0;
+    body = `<b>${unsaved ? 'Unsaved changes' : 'Saved in this browser'}</b><small>This browser can't keep a file connected. Save the file after playing and load it next time. Chrome or Edge on a computer can save automatically.</small>`;
+    actions = `<button class="btn ${unsaved ? 'primary' : ''}" data-act="download-file">Save file</button><button class="btn ${unsaved ? '' : 'primary'}" data-act="open-file">Load file</button>`;
+  }
+  const backup = FS && stats.legs.length ? '<button class="link" data-act="download-file">Download a copy</button>' : '';
+  return `
+    <section class="panel">
+      <h2>Stats file ${backup}</h2>
+      <div class="file-row"><span class="fb-icon">${ICON_FILE}</span><span class="fb-text">${body}</span></div>
+      <div class="file-actions">${actions}</div>
+    </section>`;
+}
+
+const cell = (label, value) => `<div class="cell"><span>${label}</span><b>${value}</b></div>`;
+
+function playerStatCard(a, filter) {
+  const bestCells = filter === 'all'
+    ? cell('Best 501', a.best[501] ? `${a.best[501]} <small>darts</small>` : '–') + cell('Best 301', a.best[301] ? `${a.best[301]} <small>darts</small>` : '–')
+    : cell('Best leg', a.best[+filter] ? `${a.best[+filter]} <small>darts</small>` : '–');
+  return `
+    <article class="pstat">
+      <div class="pstat-head">
+        <span class="pstat-name">${esc(a.name)}</span>
+        <span class="pstat-avg"><b>${a.avg.toFixed(1)}</b><small>3-dart avg</small></span>
+      </div>
+      <div class="pstat-grid">
+        ${cell('Legs', a.legs)}${cell('Won', a.won)}${cell('Win rate', a.winPct + '%')}${cell('First 9', a.f9d ? a.f9avg.toFixed(1) : '–')}
+        ${bestCells}${cell('Top finish', a.hiCo || '–')}${cell('Top score', a.high || '–')}
+        ${cell('180s', a.t180)}${cell('140+', a.t140)}${cell('100+', a.t100)}${cell('Busts', a.busts)}${filter === 'all' ? '' : cell('Darts', a.darts)}
+      </div>
+    </article>`;
+}
+
+function gameRow(g) {
+  const ranked = [...g.players].sort((a, b) => (g.wins[b] || 0) - (g.wins[a] || 0));
+  const top = g.wins[ranked[0]] || 0;
+  const solo = g.players.length === 1;
+  return `
+    <li class="game-row">
+      <div class="gr-top"><span>${esc(fmtDate(g.date))}</span><span>${g.start} · ${g.doubleOut ? 'Double out' : 'Single out'} · ${g.legs} leg${g.legs === 1 ? '' : 's'}</span></div>
+      <div class="gr-players">${ranked.map(n => `
+        <span class="${(g.wins[n] || 0) === top && top > 0 ? 'w' : ''}">${esc(n)} <b>${solo ? `${g.darts[n]} darts` : g.wins[n] || 0}</b></span>`).join('')}
+      </div>
+    </li>`;
+}
+
+function renderStats() {
+  const f = state.statsFilter;
+  const players = aggregate(f);
+  const games = gameList(f);
+  const shown = state.showAllGames ? games : games.slice(0, 20);
+  $app.innerHTML = `
+  <main class="setup stats-page">
+    <header class="page-head">
+      <button class="icon-btn" data-act="go-setup" aria-label="Back">${ICON_BACK}</button>
+      <h1>Statistics</h1>
+    </header>
+
+    ${filePanel()}
+
+    <div class="seg filter" role="radiogroup" aria-label="Filter by game">
+      ${['all', '301', '501'].map(v => `<button role="radio" aria-checked="${f === v}" class="${f === v ? 'on' : ''}" data-act="stats-filter" data-value="${v}">${v === 'all' ? 'All games' : v}</button>`).join('')}
+    </div>
+
+    <section class="panel">
+      <h2>Players <span class="badge">${players.length}</span></h2>
+      ${players.length ? players.map(a => playerStatCard(a, f)).join('') : '<p class="empty">No finished legs yet. Play a game and the stats show up here.</p>'}
+    </section>
+
+    <section class="panel">
+      <h2>Recent games <span class="badge">${games.length}</span></h2>
+      ${games.length ? `<ul class="games">${shown.map(gameRow).join('')}</ul>` : '<p class="empty">No games yet.</p>'}
+      ${games.length > shown.length ? `<button class="btn" data-act="show-all-games">Show all ${games.length} games</button>` : ''}
+    </section>
+  </main>`;
+}
+
+/* ---------- game ---------- */
 function renderGame() {
   const m = state.match;
   const g = replay(m);
@@ -334,6 +831,7 @@ function showWin(g) {
           </tr>`).join('')}
         </tbody>
       </table>
+      <p class="save-note" id="save-note">${saveNote()}</p>
       <div class="dlg-actions">
         <button class="btn primary big" data-act="next-leg">${multi ? 'Next leg' : 'Play again'}</button>
         <div class="row">
@@ -358,7 +856,7 @@ function showMenu() {
 function confirmEnd() {
   openDialog(`
     <h2>End this game?</h2>
-    <p>The current scores will be discarded.</p>
+    <p>The leg in progress is not counted. Finished legs stay in the stats.</p>
     <div class="dlg-actions"><div class="row">
       <button class="btn" data-act="close-dialog">Cancel</button>
       <button class="btn danger" data-act="new-game">End game</button>
@@ -366,12 +864,13 @@ function confirmEnd() {
 }
 
 let toastTimer;
-function toast(html, cls = '') {
+function toast(html, cls = '', ms = 1300) {
   $toast.innerHTML = html;
   $toast.className = 'show ' + cls;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { $toast.className = cls; }, 1300);
+  toastTimer = setTimeout(() => { $toast.className = cls; }, ms);
 }
+const toastMsg = (text, isError = false) => toast(`<span>${text}</span>`, isError ? 'msg err' : 'msg', 3200);
 
 /* ============================================================
    Actions
@@ -390,7 +889,7 @@ function addName(raw) {
 function startGame() {
   const s = state.settings;
   if (!s.players.length) return;
-  state.match = { start: s.start, doubleOut: s.doubleOut, players: [...s.players], legs: s.players.map(() => 0), leg: 1, starter: 0, throws: [] };
+  state.match = { id: uid(), start: s.start, doubleOut: s.doubleOut, players: [...s.players], legs: s.players.map(() => 0), leg: 1, starter: 0, throws: [], legRecordId: null };
   state.mod = 1;
   persistMatch();
 }
@@ -402,6 +901,7 @@ function addDart(n, x) {
   if (n === 0) x = 1;
   m.throws.push({ n, x });
   state.mod = 1;
+  syncLegRecord();
   persistMatch();
   buzz(8);
 
@@ -427,6 +927,7 @@ function undo() {
   if (!m || !m.throws.length) return;
   m.throws.pop();
   state.mod = 1;
+  syncLegRecord();
   persistMatch();
   buzz(15);
   render();
@@ -440,6 +941,7 @@ function nextLeg() {
   m.leg++;
   m.starter = (m.starter + 1) % m.players.length; // starting player rotates each leg
   m.throws = [];
+  m.legRecordId = null; // the finished leg stays in the stats
   state.mod = 1;
   persistMatch();
   closeDialog();
@@ -449,6 +951,7 @@ function nextLeg() {
 function endGame() {
   state.match = null;
   state.mod = 1;
+  state.view = 'setup';
   persistMatch();
   closeDialog();
   render();
@@ -490,13 +993,22 @@ document.addEventListener('click', e => {
       state.roster = state.roster.filter(n => n !== el.dataset.name);
       persistSetup(); break;
     case 'start-game': startGame(); break;
+    case 'go-stats': state.view = 'stats'; state.showAllGames = false; render(); window.scrollTo(0, 0); return;
+    case 'go-setup': state.view = 'setup'; render(); window.scrollTo(0, 0); return;
+    case 'stats-filter': state.statsFilter = el.dataset.value; break;
+    case 'show-all-games': state.showAllGames = true; break;
+    case 'open-file': return openStatsFile();
+    case 'create-file': return createStatsFile();
+    case 'reconnect-file': return reconnectFile();
+    case 'disconnect-file': return disconnectFile();
+    case 'download-file': return downloadStats();
     case 'miss': return addDart(0, 1);
     case 'bull': return addDart(25, 2);
     case 'undo': return undo();
     case 'menu': return showMenu();
     case 'close-dialog': closeDialog(); return;
     case 'confirm-end': return confirmEnd();
-    case 'restart-leg': state.match.throws = []; persistMatch(); closeDialog(); break;
+    case 'restart-leg': state.match.throws = []; syncLegRecord(); persistMatch(); closeDialog(); break;
     case 'next-leg': return nextLeg();
     case 'new-game': return endGame();
     default: return;
@@ -576,4 +1088,6 @@ async function keepAwake(on) {
 }
 document.addEventListener('visibilitychange', () => keepAwake(!!state.match));
 
+if (state.match && !state.match.id) state.match.id = uid();
 render();
+initFile();

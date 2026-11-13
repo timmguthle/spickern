@@ -1,6 +1,6 @@
 {
-  "name": "Dart Scorer",
-  "short_name": "Darts",
+  "name": "Spickern",
+  "short_name": "Spickern",
   "start_url": ".",
   "display": "standalone",
   "background_color": "#0d1110",
